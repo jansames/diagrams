@@ -1,14 +1,23 @@
 import streamlit as st
 import pandas as pd
 
+# Ensure the correct Excel engine is available at runtime
+try:
+    import openpyxl  # noqa: F401
+except ModuleNotFoundError:
+    st.error(
+        "The **openpyxl** package is required to read .xlsx files.\n\nInstall it via `pip install openpyxl` (or add `openpyxl` to your `requirements.txt` if you deploy to Streamlit Cloud) and restart the app."
+    )
+    st.stop()
+
 
 def detect_format(df: pd.DataFrame) -> str:
     """Classify the Excel sheet structure.
 
     Returns one of:
-      - "1D Diagram"
-      - "2D Diagram"
-      - "Error - unrecognized format"
+        - "1D Diagram"
+        - "2D Diagram"
+        - "Error - unrecognized format"
     """
     # Basic sanitation: drop completely empty rows/cols and reset index
     df = df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
@@ -21,7 +30,7 @@ def detect_format(df: pd.DataFrame) -> str:
             pd.to_datetime(ts_col)
             if pd.api.types.is_numeric_dtype(val_col):
                 return "1D Diagram"
-        except Exception:  # noqa: BLE001 – any parsing failure means not 1D
+        except Exception:  # noqa: BLE001 – parsing failure means not 1D
             pass
 
     # 2D: ≥3 columns → date + multiple interval columns (numeric)
@@ -30,7 +39,6 @@ def detect_format(df: pd.DataFrame) -> str:
         interval_df = df.iloc[:, 1:]
         try:
             pd.to_datetime(date_col)
-            # All remaining columns must be numeric
             if all(pd.api.types.is_numeric_dtype(interval_df[c]) for c in interval_df.columns):
                 return "2D Diagram"
         except Exception:  # noqa: BLE001
@@ -53,7 +61,6 @@ def main() -> None:
         st.stop()
 
     try:
-        # Handle workbooks with multiple sheets
         workbook = pd.ExcelFile(uploaded_file)
         sheet_names = workbook.sheet_names
         sheet = sheet_names[0]
