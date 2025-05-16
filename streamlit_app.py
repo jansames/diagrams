@@ -1,15 +1,13 @@
 """streamlit_app.py
 
-An interactive Streamlit utility that classifies electricity‑consumption Excel
-sheets as either 1‑D or 2‑D diagrams and determines their granularity (hourly
-or 15‑minute) over a complete calendar year.
+Classify electricity‑consumption Excel sheets as:
+  • 1‑D hourly (8 760 / 8 784 rows)
+  • 1‑D 15‑minute (35 040 / 35 136 rows)
+  • 2‑D hourly (365 / 366 rows × 24 cols)
+  • 2‑D 15‑minute (365 / 366 rows × 96 cols)
 
-Returns one of:
-    - "1D hourly"
-    - "1D 15 minutes"
-    - "2D hourly"
-    - "2D 15 minutes"
-    - "Error - …" (with explanation)
+On failure, a *very* specific error is returned telling the user exactly what
+looks wrong (row count, column count, date‑parsing issues, etc.).
 """
 
 from __future__ import annotations
@@ -17,7 +15,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-# ------------------------------ Constants ---------------------------------- #
+# ──────────────────────────────── Constants ────────────────────────────────── #
 HOUR_ROWS_NONLEAP = 8_760
 HOUR_ROWS_LEAP = 8_784
 Q15_ROWS_NONLEAP = 35_040
@@ -31,83 +29,82 @@ ROWS_1D = {
 }
 ROWS_2D = {365, 366}
 
+# ───────────────────────────── Helper utilities ───────────────────────────── #
 
-# ------------------------------ Helpers ------------------------------------ #
-
-def _safe_to_datetime(series: pd.Series) -> pd.Series | None:
-    """Convert *series* to datetime; return *None* if any entry fails."""
+def _safe_to_datetime(series: pd.Series) -> tuple[pd.Series | None, str | None]:
+    """Return (datetime_series, error_msg).  *error_msg* is *None* on success."""
 
     dt = pd.to_datetime(series, errors="coerce")
     if dt.isna().any():
-        return None
-    return dt
+        return None, "Failed to parse dates/timestamps in the first column."
+    return dt, None
 
 
-# ------------------------------ Core logic --------------------------------- #
+def _explain_mismatch(found: int, expected: list[int]) -> str:
+    exp_str = ", ".join(str(e) for e in expected)
+    return f"Found **{found}**, but expected one of **{exp_str}**."
 
-def detect_format(df: pd.DataFrame) -> str:
-    """Detect diagram layout & granularity.
 
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Raw DataFrame from Excel.
+# ───────────────────────────── Core detection ─────────────────────────────── #
 
-    Returns
-    -------
-    str
-        One of the labels listed in the module docstring.
-    """
+def detect_format(df: pd.DataFrame) -> tuple[str, str]:
+    """Return (label, detail).  *label* begins with "Error" on failure."""
 
-    # Strip completely empty rows/cols for robust detection
+    # Strip empty rows/cols early for robust counting
     df = df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    rows, cols = df.shape
 
-    # --------------------------- 1‑D candidate ----------------------------- #
-    if df.shape[0] in ROWS_1D and df.shape[1] >= 2:
-        ts = _safe_to_datetime(df.iloc[:, 0])
-        if ts is not None and (ts.dt.hour.max() > 0 or ts.dt.minute.max() > 0):
-            rows = len(df)
+    # ───────────── 1‑D candidate ───────────── #
+    if rows in ROWS_1D and cols >= 2:
+        ts, err = _safe_to_datetime(df.iloc[:, 0])
+        if ts is None:
+            return "Error - timestamp parsing", err  # type: ignore[return-value]
+        if ts.dt.hour.max() > 0 or ts.dt.minute.max() > 0:
             if rows in {HOUR_ROWS_NONLEAP, HOUR_ROWS_LEAP}:
-                return "1D hourly"
+                return "1D hourly", "Row count matches a full year of hourly data."
             if rows in {Q15_ROWS_NONLEAP, Q15_ROWS_LEAP}:
-                return "1D 15 minutes"
-            return (
-                "Error - 1D detected but unexpected row count; expected 8760/8784 or"
-                " 35040/35136."
-            )
+                return "1D 15 minutes", "Row count matches a full year of 15‑minute data."
+            msg = _explain_mismatch(rows, [*ROWS_1D])
+            return "Error - unexpected row count for 1D", msg  # type: ignore[return-value]
 
-    # --------------------------- 2‑D candidate ----------------------------- #
-    if df.shape[0] in ROWS_2D and df.shape[1] >= 2:
-        dates = _safe_to_datetime(df.iloc[:, 0])
-        if dates is not None and dates.dt.hour.eq(0).all() and dates.dt.minute.eq(0).all():
-            numeric_cols = [c for c in df.columns[1:] if pd.api.types.is_numeric_dtype(df[c])]
-            n = len(numeric_cols)
-            if n == 24:
-                return "2D hourly"
-            if n == 96:
-                return "2D 15 minutes"
-            return (
-                f"Error - 2D layout detected but found {n} numeric columns; expected 24 "
-                "(hourly) or 96 (15‑min)."
-            )
+    # ───────────── 2‑D candidate ───────────── #
+    if rows in ROWS_2D and cols >= 2:
+        dates, err = _safe_to_datetime(df.iloc[:, 0])
+        if dates is None:
+            return "Error - date parsing", err  # type: ignore[return-value]
+        if not (dates.dt.hour.eq(0).all() and dates.dt.minute.eq(0).all()):
+            return "Error - first column not pure dates", "First column includes non‑midnight timestamps."
 
-    # --------------------------- Failure ----------------------------------- #
-    return "Error - unrecognized format"
+        n_interval_cols = cols - 1
+        if n_interval_cols == 24:
+            return "2D hourly", "365/366 rows × 24 interval columns detected."
+        if n_interval_cols == 96:
+            return "2D 15 minutes", "365/366 rows × 96 interval columns detected."
+        msg = _explain_mismatch(n_interval_cols, [24, 96])
+        return "Error - unexpected number of interval columns", msg  # type: ignore[return-value]
+
+    # ───────────── Unknown ───────────── #
+    detail = (
+        "Could not match known patterns.\n\n"
+        f"• Row count after cleaning: **{rows}**\n"
+        f"• Total columns: **{cols}**"
+    )
+    return "Error - unrecognized format", detail  # type: ignore[return-value]
 
 
-# ----------------------------- Streamlit UI -------------------------------- #
+# ───────────────────────────── Streamlit UI ───────────────────────────────── #
 
 def main() -> None:  # noqa: D401
     st.set_page_config(page_title="Electricity Diagram Format Recognizer", page_icon="⚡")
     st.title("⚡ Electricity Diagram Format Recognizer")
 
-    # Ensure openpyxl is available before proceeding
+    # Check openpyxl availability
     try:
         import openpyxl  # noqa: F401
     except ModuleNotFoundError:
         st.error(
-            "**openpyxl** is required to read .xlsx files. Install it with `pip install "
-            "openpyxl` (or add it to *requirements.txt*) and restart."
+            "**openpyxl** is required to read .xlsx files. Install it with `pip install openpyxl`"
+            " (or add it to *requirements.txt*) and restart."
         )
         st.stop()
 
@@ -116,35 +113,34 @@ def main() -> None:  # noqa: D401
         st.info("⬆️ Drag & drop or browse to upload an Excel file.")
         st.stop()
 
-    # Attempt to read the workbook
+    # Read workbook
     try:
         xls = pd.ExcelFile(uploaded)
     except Exception as exc:  # noqa: BLE001
         st.error(f"❌ Could not open file: {exc}")
         st.stop()
 
-    # Sheet selection UI
+    # Select sheet (default: first)
     sheet = xls.sheet_names[0]
     if len(xls.sheet_names) > 1:
         sheet = st.selectbox("Select sheet", xls.sheet_names, key="sheet_select")
 
-    # Parse selected sheet
     try:
         df = xls.parse(sheet)
     except Exception as exc:  # noqa: BLE001
         st.error(f"❌ Failed to parse sheet: {exc}")
         st.stop()
 
-    # Data preview
     st.subheader("Data preview (first 5 rows)")
     st.dataframe(df.head())
 
-    # Format detection
-    result = detect_format(df)
-    if result.startswith("Error"):
-        st.error(result)
+    label, info = detect_format(df)
+    if label.startswith("Error"):
+        st.error(label)
+        st.write(info)
     else:
-        st.success(f"Detected format: **{result}**")
+        st.success(f"Detected format: **{label}**")
+        st.write(info)
 
 
 if __name__ == "__main__":
