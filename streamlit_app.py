@@ -1,81 +1,150 @@
-import streamlit as st
+"""streamlit_app.py
+
+An interactive Streamlit utility that classifies electricity‑consumption Excel
+sheets as either 1‑D or 2‑D diagrams and determines their granularity (hourly
+or 15‑minute) over a complete calendar year.
+
+Returns one of:
+    - "1D hourly"
+    - "1D 15 minutes"
+    - "2D hourly"
+    - "2D 15 minutes"
+    - "Error - …" (with explanation)
+"""
+
+from __future__ import annotations
+
 import pandas as pd
+import streamlit as st
 
-# Ensure the correct Excel engine is available at runtime
-try:
-    import openpyxl  # noqa: F401
-except ModuleNotFoundError:
-    st.error(
-        "The **openpyxl** package is required to read .xlsx files.\n\nInstall it via `pip install openpyxl` (or add `openpyxl` to your `requirements.txt` if you deploy to Streamlit Cloud) and restart the app."
-    )
-    st.stop()
+# ------------------------------ Constants ---------------------------------- #
+HOUR_ROWS_NONLEAP = 8_760
+HOUR_ROWS_LEAP = 8_784
+Q15_ROWS_NONLEAP = 35_040
+Q15_ROWS_LEAP = 35_136
 
+ROWS_1D = {
+    HOUR_ROWS_NONLEAP,
+    HOUR_ROWS_LEAP,
+    Q15_ROWS_NONLEAP,
+    Q15_ROWS_LEAP,
+}
+ROWS_2D = {365, 366}
+
+
+# ------------------------------ Helpers ------------------------------------ #
+
+def _safe_to_datetime(series: pd.Series) -> pd.Series | None:
+    """Convert *series* to datetime; return *None* if any entry fails."""
+
+    dt = pd.to_datetime(series, errors="coerce")
+    if dt.isna().any():
+        return None
+    return dt
+
+
+# ------------------------------ Core logic --------------------------------- #
 
 def detect_format(df: pd.DataFrame) -> str:
-    """Classify the Excel sheet structure.
+    """Detect diagram layout & granularity.
 
-    Returns one of:
-        - "1D Diagram"
-        - "2D Diagram"
-        - "Error - unrecognized format"
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Raw DataFrame from Excel.
+
+    Returns
+    -------
+    str
+        One of the labels listed in the module docstring.
     """
-    # Basic sanitation: drop completely empty rows/cols and reset index
+
+    # Strip completely empty rows/cols for robust detection
     df = df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
 
-    # 1D: two columns → timestamp + numeric consumption
-    if df.shape[1] == 2:
-        ts_col = df.iloc[:, 0]
-        val_col = df.iloc[:, 1]
-        try:
-            pd.to_datetime(ts_col)
-            if pd.api.types.is_numeric_dtype(val_col):
-                return "1D Diagram"
-        except Exception:  # noqa: BLE001 – parsing failure means not 1D
-            pass
+    # --------------------------- 1‑D candidate ----------------------------- #
+    if df.shape[0] in ROWS_1D and df.shape[1] >= 2:
+        ts = _safe_to_datetime(df.iloc[:, 0])
+        if ts is not None and (ts.dt.hour.max() > 0 or ts.dt.minute.max() > 0):
+            rows = len(df)
+            if rows in {HOUR_ROWS_NONLEAP, HOUR_ROWS_LEAP}:
+                return "1D hourly"
+            if rows in {Q15_ROWS_NONLEAP, Q15_ROWS_LEAP}:
+                return "1D 15 minutes"
+            return (
+                "Error - 1D detected but unexpected row count; expected 8760/8784 or"
+                " 35040/35136."
+            )
 
-    # 2D: ≥3 columns → date + multiple interval columns (numeric)
-    if df.shape[1] >= 3:
-        date_col = df.iloc[:, 0]
-        interval_df = df.iloc[:, 1:]
-        try:
-            pd.to_datetime(date_col)
-            if all(pd.api.types.is_numeric_dtype(interval_df[c]) for c in interval_df.columns):
-                return "2D Diagram"
-        except Exception:  # noqa: BLE001
-            pass
+    # --------------------------- 2‑D candidate ----------------------------- #
+    if df.shape[0] in ROWS_2D and df.shape[1] >= 2:
+        dates = _safe_to_datetime(df.iloc[:, 0])
+        if dates is not None and dates.dt.hour.eq(0).all() and dates.dt.minute.eq(0).all():
+            numeric_cols = [c for c in df.columns[1:] if pd.api.types.is_numeric_dtype(df[c])]
+            n = len(numeric_cols)
+            if n == 24:
+                return "2D hourly"
+            if n == 96:
+                return "2D 15 minutes"
+            return (
+                f"Error - 2D layout detected but found {n} numeric columns; expected 24 "
+                "(hourly) or 96 (15‑min)."
+            )
 
+    # --------------------------- Failure ----------------------------------- #
     return "Error - unrecognized format"
 
 
-def main() -> None:
+# ----------------------------- Streamlit UI -------------------------------- #
+
+def main() -> None:  # noqa: D401
     st.set_page_config(page_title="Electricity Diagram Format Recognizer", page_icon="⚡")
     st.title("⚡ Electricity Diagram Format Recognizer")
 
-    uploaded_file = st.file_uploader(
-        "Upload an XLSX file containing your consumption diagram",
-        type=["xlsx", "xls"],
-    )
-
-    if uploaded_file is None:
-        st.info("⬆️  Drag & drop or browse to upload an Excel file.")
+    # Ensure openpyxl is available before proceeding
+    try:
+        import openpyxl  # noqa: F401
+    except ModuleNotFoundError:
+        st.error(
+            "**openpyxl** is required to read .xlsx files. Install it with `pip install "
+            "openpyxl` (or add it to *requirements.txt*) and restart."
+        )
         st.stop()
 
+    uploaded = st.file_uploader("Upload an XLSX workbook", type=["xlsx", "xls"], key="uploader")
+    if uploaded is None:
+        st.info("⬆️ Drag & drop or browse to upload an Excel file.")
+        st.stop()
+
+    # Attempt to read the workbook
     try:
-        workbook = pd.ExcelFile(uploaded_file)
-        sheet_names = workbook.sheet_names
-        sheet = sheet_names[0]
-        if len(sheet_names) > 1:
-            sheet = st.selectbox("Select sheet to analyze", sheet_names)
-
-        df = workbook.parse(sheet)
-        st.subheader("Data preview (first 5 rows)")
-        st.dataframe(df.head())
-
-        detected = detect_format(df)
-        st.success(f"Detected format: **{detected}**")
-
+        xls = pd.ExcelFile(uploaded)
     except Exception as exc:  # noqa: BLE001
-        st.error(f"❌ Could not read the Excel file: {exc}")
+        st.error(f"❌ Could not open file: {exc}")
+        st.stop()
+
+    # Sheet selection UI
+    sheet = xls.sheet_names[0]
+    if len(xls.sheet_names) > 1:
+        sheet = st.selectbox("Select sheet", xls.sheet_names, key="sheet_select")
+
+    # Parse selected sheet
+    try:
+        df = xls.parse(sheet)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"❌ Failed to parse sheet: {exc}")
+        st.stop()
+
+    # Data preview
+    st.subheader("Data preview (first 5 rows)")
+    st.dataframe(df.head())
+
+    # Format detection
+    result = detect_format(df)
+    if result.startswith("Error"):
+        st.error(result)
+    else:
+        st.success(f"Detected format: **{result}**")
 
 
 if __name__ == "__main__":
