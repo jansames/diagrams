@@ -1,21 +1,17 @@
 """streamlit_app.py
 
-Detects and classifies electricity‑consumption Excel sheets, with flexible
-handling of multi‑year data sets.
+Detects and classifies electricity‑consumption Excel sheets, with robust error
+handling so that unexpected problems surface as *friendly* messages rather
+than a generic "Axios 400" in the browser.
 
-Key assumptions (based on real‑world metering conventions):
+## Assumptions
 * **1‑D hourly** data are labelled with the *end* of each interval, so the first
-  timestamp of a year is **01‑Jan 01:00** and the final timestamp is
-  **01‑Jan 00:00 of the next year**. That gives 8 760 (or 8 784) rows. We still
-  accept 1 row fewer if that final 00:00 value is missing.
-* **1‑D 15‑minute** data start at **01‑Jan 00:15** and finish at **01‑Jan 00:00
-  next year**, totalling 35 040 (or 35 136) rows; again we tolerate –1 if the
-  last value is absent.
-* **2‑D hourly** & **2‑D 15‑minute** sheets list one date per row (≥365 rows)
-  and at least 24 / 96 numeric interval columns (extras such as totals are
-  ignored).
+  timestamp of a year is **01‑Jan 01:00**.
+* **1‑D 15‑minute** data start at **01‑Jan 00:15**.
+* **2‑D** sheets have one date per row and ≥24 / ≥96 numeric columns.
 
-Friendly error messages explain *exactly* why a sheet doesn’t match.
+The detector tolerates a missing *final midnight* row (–1) and ignores extra
+numeric columns in 2‑D layouts.
 """
 
 from __future__ import annotations
@@ -26,17 +22,28 @@ from typing import Final
 
 import pandas as pd
 import streamlit as st
+from openpyxl.utils.exceptions import InvalidFileException
 
-# ──────────────────────────────── CONSTANTS ───────────────────────────────── #
+# ─────────────────────────────── CONSTANTS ───────────────────────────────── #
 HOUR_ROWS_NONLEAP: Final = 8_760
 HOUR_ROWS_LEAP: Final = 8_784
 Q15_ROWS_NONLEAP: Final = 35_040
 Q15_ROWS_LEAP: Final = 35_136
 
-# Accept one‑row short (missing final 00:00)
-ACCEPTABLE_HOURLY = {HOUR_ROWS_NONLEAP, HOUR_ROWS_NONLEAP - 1, HOUR_ROWS_LEAP, HOUR_ROWS_LEAP - 1}
-ACCEPTABLE_15M = {Q15_ROWS_NONLEAP, Q15_ROWS_NONLEAP - 1, Q15_ROWS_LEAP, Q15_ROWS_LEAP - 1}
+ACCEPTABLE_HOURLY = {
+    HOUR_ROWS_NONLEAP,
+    HOUR_ROWS_NONLEAP - 1,
+    HOUR_ROWS_LEAP,
+    HOUR_ROWS_LEAP - 1,
+}
+ACCEPTABLE_15M = {
+    Q15_ROWS_NONLEAP,
+    Q15_ROWS_NONLEAP - 1,
+    Q15_ROWS_LEAP,
+    Q15_ROWS_LEAP - 1,
+}
 
+MAX_UPLOAD_MB: Final = 50  # hard‑stop for very large files (>50 MB)
 
 # ─────────────────────────────── HELPERS ─────────────────────────────────── #
 
@@ -48,14 +55,12 @@ def _safe_to_datetime(series: pd.Series) -> tuple[pd.Series | None, str | None]:
 
 
 def _mask_hourly(dt: pd.Series, year: int) -> pd.Series:
-    """Rows whose timestamps are [01‑Jan 01:00, 01‑Jan 01:00 next year)."""
     start = datetime(year, 1, 1, 1)
     end = datetime(year + 1, 1, 1, 1)
     return (dt >= start) & (dt < end)
 
 
 def _mask_15m(dt: pd.Series, year: int) -> pd.Series:
-    """Rows whose timestamps are [01‑Jan 00:15, 01‑Jan 00:15 next year)."""
     start = datetime(year, 1, 1, 0, 15)
     end = datetime(year + 1, 1, 1, 0, 15)
     return (dt >= start) & (dt < end)
@@ -87,25 +92,26 @@ def detect_format(df: pd.DataFrame) -> tuple[str, str]:
             leap = calendar.isleap(y)
             exp_h_full = HOUR_ROWS_LEAP if leap else HOUR_ROWS_NONLEAP
             if rows_h in ACCEPTABLE_HOURLY:
-                missing = " (final 00:00 missing)" if rows_h == exp_h_full - 1 else ""
+                miss = " (final 00:00 missing)" if rows_h == exp_h_full - 1 else ""
                 return (
                     "1D hourly",
-                    f"{rows_h} rows for {y}{missing}. Expected {exp_h_full} rows starting 01:00.",
+                    f"{rows_h} rows for {y}{miss}. Expected {exp_h_full} rows starting 01:00.",
                 )
 
             # 15‑minute window
             rows_q = int(_mask_15m(dt, y).sum())
             exp_q_full = Q15_ROWS_LEAP if leap else Q15_ROWS_NONLEAP
             if rows_q in ACCEPTABLE_15M:
-                missing = " (final 00:00 missing)" if rows_q == exp_q_full - 1 else ""
+                miss = " (final 00:00 missing)" if rows_q == exp_q_full - 1 else ""
                 return (
                     "1D 15 minutes",
-                    f"{rows_q} rows for {y}{missing}. Expected {exp_q_full} rows starting 00:15.",
+                    f"{rows_q} rows for {y}{miss}. Expected {exp_q_full} rows starting 00:15.",
                 )
 
         # No acceptable year found
         summaries = [
-            f"{y}: {_mask_hourly(dt, y).sum()}‑hour, {_mask_15m(dt, y).sum()}‑15‑min rows" for y in sorted({d.year for d in dt})
+            f"{y}: {_mask_hourly(dt, y).sum()}‑hour, {_mask_15m(dt, y).sum()}‑15‑min rows"
+            for y in sorted({d.year for d in dt})
         ]
         return (
             "Error – no full 1‑D year",
@@ -149,6 +155,7 @@ def main() -> None:  # noqa: D401
     st.set_page_config(page_title="Electricity Diagram Format Recognizer", page_icon="⚡")
     st.title("⚡ Electricity Diagram Format Recognizer")
 
+    # Dependency check
     try:
         import openpyxl  # noqa: F401 – presence check
     except ModuleNotFoundError:
@@ -160,26 +167,46 @@ def main() -> None:  # noqa: D401
         st.info("⬆️ Drag‑and‑drop or browse to upload an Excel file.")
         st.stop()
 
+    # File‑size guard
+    if upl.size > MAX_UPLOAD_MB * 1024 * 1024:
+        st.error(f"File exceeds {MAX_UPLOAD_MB} MB upload limit. Please provide a smaller file.")
+        st.stop()
+
+    # Attempt to open workbook
     try:
         xls = pd.ExcelFile(upl)
+    except InvalidFileException as exc:
+        st.error("❌ The file appears to be corrupted or not a valid XLSX.")
+        st.exception(exc)
+        st.stop()
     except Exception as exc:  # noqa: BLE001
-        st.error(f"❌ Could not open file: {exc}")
+        st.error("❌ Could not open Excel file.")
+        st.exception(exc)
         st.stop()
 
     sheet = xls.sheet_names[0]
     if len(xls.sheet_names) > 1:
         sheet = st.selectbox("Select sheet", xls.sheet_names)
 
+    # Parse selected sheet
     try:
         df = xls.parse(sheet)
     except Exception as exc:  # noqa: BLE001
-        st.error(f"❌ Failed to parse sheet: {exc}")
+        st.error("❌ Failed to parse the selected sheet.")
+        st.exception(exc)
         st.stop()
 
-    st.subheader("Data preview (first 5 rows)")
-    st.dataframe(df.head())
+    st.subheader("Data preview (first 5 rows, first 50 columns)")
+    st.dataframe(df.iloc[:5, :50])
 
-    label, detail = detect_format(df)
+    # Detect format with safety net
+    try:
+        label, detail = detect_format(df)
+    except Exception as exc:  # noqa: BLE001
+        st.error("❌ Unexpected error while analysing the sheet.")
+        st.exception(exc)
+        st.stop()
+
     if label.startswith("Error"):
         st.error(label)
         st.write(detail)
