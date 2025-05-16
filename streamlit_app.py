@@ -1,174 +1,174 @@
 """streamlit_app.py
 
-Classify electricity‑consumption Excel sheets even when they contain several
-years of data.  The app focuses on the first **complete** calendar year it can
-find and labels the sheet as one of:
+Detects and classifies electricity‑consumption Excel sheets, with flexible
+handling of multi‑year data sets.
 
-* 1‑D hourly
-* 1‑D 15 minutes
-* 2‑D hourly
-* 2‑D 15 minutes
+Key assumptions (based on real‑world metering conventions):
+* **1‑D hourly** data are labelled with the *end* of each interval, so the first
+  timestamp of a year is **01‑Jan 01:00** and the final timestamp is
+  **01‑Jan 00:00 of the next year**. That gives 8 760 (or 8 784) rows. We still
+  accept 1 row fewer if that final 00:00 value is missing.
+* **1‑D 15‑minute** data start at **01‑Jan 00:15** and finish at **01‑Jan 00:00
+  next year**, totalling 35 040 (or 35 136) rows; again we tolerate –1 if the
+  last value is absent.
+* **2‑D hourly** & **2‑D 15‑minute** sheets list one date per row (≥365 rows)
+  and at least 24 / 96 numeric interval columns (extras such as totals are
+  ignored).
 
-— with detailed, user‑friendly error explanations if something doesn’t look
-right (row‑ or column‑count mismatch, parsing problems, etc.).
+Friendly error messages explain *exactly* why a sheet doesn’t match.
 """
 
 from __future__ import annotations
 
+import calendar
+from datetime import datetime
+from typing import Final
+
 import pandas as pd
 import streamlit as st
 
-# ──────────────────────────────── Constants ────────────────────────────────── #
-HOUR_ROWS_NONLEAP = 8_760
-HOUR_ROWS_LEAP = 8_784
-Q15_ROWS_NONLEAP = 35_040
-Q15_ROWS_LEAP = 35_136
+# ──────────────────────────────── CONSTANTS ───────────────────────────────── #
+HOUR_ROWS_NONLEAP: Final = 8_760
+HOUR_ROWS_LEAP: Final = 8_784
+Q15_ROWS_NONLEAP: Final = 35_040
+Q15_ROWS_LEAP: Final = 35_136
 
-FULL_YEAR_ROWS_1D = {
-    HOUR_ROWS_NONLEAP,
-    HOUR_ROWS_LEAP,
-    Q15_ROWS_NONLEAP,
-    Q15_ROWS_LEAP,
-}
+# Accept one‑row short (missing final 00:00)
+ACCEPTABLE_HOURLY = {HOUR_ROWS_NONLEAP, HOUR_ROWS_NONLEAP - 1, HOUR_ROWS_LEAP, HOUR_ROWS_LEAP - 1}
+ACCEPTABLE_15M = {Q15_ROWS_NONLEAP, Q15_ROWS_NONLEAP - 1, Q15_ROWS_LEAP, Q15_ROWS_LEAP - 1}
 
-# ───────────────────────────── Helper utilities ───────────────────────────── #
+
+# ─────────────────────────────── HELPERS ─────────────────────────────────── #
 
 def _safe_to_datetime(series: pd.Series) -> tuple[pd.Series | None, str | None]:
-    """Convert to datetime; return (*dt*, *err_msg*)."""
-
     dt = pd.to_datetime(series, errors="coerce")
     if dt.isna().any():
         return None, "Failed to parse valid dates/timestamps in the first column."
     return dt, None
 
 
-def _explain_mismatch(found: int, expected: list[int | str]) -> str:
-    exp_str = ", ".join(str(e) for e in expected)
-    return f"Found **{found}**, expected one of **{exp_str}**."
+def _mask_hourly(dt: pd.Series, year: int) -> pd.Series:
+    """Rows whose timestamps are [01‑Jan 01:00, 01‑Jan 01:00 next year)."""
+    start = datetime(year, 1, 1, 1)
+    end = datetime(year + 1, 1, 1, 1)
+    return (dt >= start) & (dt < end)
 
 
-# ───────────────────────────── Core detection ─────────────────────────────── #
+def _mask_15m(dt: pd.Series, year: int) -> pd.Series:
+    """Rows whose timestamps are [01‑Jan 00:15, 01‑Jan 00:15 next year)."""
+    start = datetime(year, 1, 1, 0, 15)
+    end = datetime(year + 1, 1, 1, 0, 15)
+    return (dt >= start) & (dt < end)
+
+
+def _explain(found: int, expected: list[int | str]) -> str:
+    exp = ", ".join(str(e) for e in expected)
+    return f"Found **{found}**, expected **{exp}**."
+
+
+# ───────────────────────────── CORE DETECTOR ─────────────────────────────── #
 
 def detect_format(df: pd.DataFrame) -> tuple[str, str]:
-    """Return (*label*, *detail*).  *label* starts with "Error" on failure."""
+    """Return (*label*, *detail*).  *label* begins with "Error" on failure."""
 
-    # Remove completely empty rows/cols (headers are not part of *df.shape*)
     df = df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
-    total_rows, total_cols = df.shape
 
-    # First‑column must be datetime‑convertible for *all* supported layouts
     dt, err = _safe_to_datetime(df.iloc[:, 0])
     if dt is None:
-        return "Error - date parsing", err  # type: ignore[return-value]
+        return "Error – date parsing", err  # type: ignore[return-value]
 
-    # Detect 1‑D vs 2‑D based on presence of time information in timestamps
-    has_time_detail = (dt.dt.hour.max() > 0) or (dt.dt.minute.max() > 0)
+    has_times = (dt.dt.hour.gt(0) | dt.dt.minute.gt(0)).any()
 
-    # ────────────────────────── 1‑D candidate ────────────────────────────── #
-    if has_time_detail:
-        # Group by calendar year and look for a *complete* one
-        year_counts = dt.dt.year.value_counts().sort_index()
-        for year, count in year_counts.items():
-            if count in FULL_YEAR_ROWS_1D:
-                if count in {HOUR_ROWS_NONLEAP, HOUR_ROWS_LEAP}:
-                    return (
-                        "1D hourly",
-                        f"Detected {count} rows for {year} – full hourly dataset.",
-                    )
-                if count in {Q15_ROWS_NONLEAP, Q15_ROWS_LEAP}:
-                    return (
-                        "1D 15 minutes",
-                        f"Detected {count} rows for {year} – full 15‑minute dataset.",
-                    )
-        # If we get here: no complete year found
-        detail = (
-            "1‑D style timestamps, but no calendar year has a full set of rows.\n\n"
-            + "Row counts per year: "
-            + ", ".join(f"{y}: {c}" for y, c in year_counts.items())
-        )
-        return "Error - incomplete 1D year", detail  # type: ignore[return-value]
+    # ───────────────────────────── 1‑D PATH ──────────────────────────────── #
+    if has_times:
+        for y in sorted({d.year for d in dt}):
+            # Hourly window
+            rows_h = int(_mask_hourly(dt, y).sum())
+            leap = calendar.isleap(y)
+            exp_h_full = HOUR_ROWS_LEAP if leap else HOUR_ROWS_NONLEAP
+            if rows_h in ACCEPTABLE_HOURLY:
+                missing = " (final 00:00 missing)" if rows_h == exp_h_full - 1 else ""
+                return (
+                    "1D hourly",
+                    f"{rows_h} rows for {y}{missing}. Expected {exp_h_full} rows starting 01:00.",
+                )
 
-    # ────────────────────────── 2‑D candidate ────────────────────────────── #
-    # Must be midnight‑only dates
-    if not (dt.dt.hour.eq(0).all() and dt.dt.minute.eq(0).all()):
+            # 15‑minute window
+            rows_q = int(_mask_15m(dt, y).sum())
+            exp_q_full = Q15_ROWS_LEAP if leap else Q15_ROWS_NONLEAP
+            if rows_q in ACCEPTABLE_15M:
+                missing = " (final 00:00 missing)" if rows_q == exp_q_full - 1 else ""
+                return (
+                    "1D 15 minutes",
+                    f"{rows_q} rows for {y}{missing}. Expected {exp_q_full} rows starting 00:15.",
+                )
+
+        # No acceptable year found
+        summaries = [
+            f"{y}: {_mask_hourly(dt, y).sum()}‑hour, {_mask_15m(dt, y).sum()}‑15‑min rows" for y in sorted({d.year for d in dt})
+        ]
         return (
-            "Error - first column contains times",
-            "2‑D diagrams should have *dates only* (00:00) in first column.",
+            "Error – no full 1‑D year",
+            "Row counts → " + "; ".join(summaries),
         )  # type: ignore[return-value]
 
-    # Numeric interval columns (ignore text columns like *Remark*, etc.)
+    # ───────────────────────────── 2‑D PATH ──────────────────────────────── #
+    if (dt.dt.hour != 0).any() or (dt.dt.minute != 0).any():
+        return (
+            "Error – first column contains times",
+            "2‑D diagrams must have *dates only* (midnight) in the first column.",
+        )  # type: ignore[return-value]
+
     numeric_cols = [c for c in df.columns[1:] if pd.api.types.is_numeric_dtype(df[c])]
-    n_numeric = len(numeric_cols)
+    n_num = len(numeric_cols)
+    if n_num < 24:
+        return "Error – too few interval columns", _explain(n_num, ["≥24"])  # type: ignore[return-value]
 
-    # Determine granularity based on number of numeric columns (≥24 → hourly, ≥96 → 15‑min)
-    if n_numeric < 24:
-        return (
-            "Error - not enough interval columns",
-            _explain_mismatch(n_numeric, ["≥24 for hourly", "≥96 for 15‑minute"]),
-        )  # type: ignore[return-value]
+    gran = "hourly" if n_num < 96 else "15 minutes"
+    expected_cols = 24 if gran == "hourly" else 96
 
-    granularity = "hourly" if n_numeric < 96 else "15 minutes"
-    expected_cols = 24 if granularity == "hourly" else 96
-
-    # Pick the first calendar year that has ≥365 rows
-    year_counts = dt.dt.year.value_counts().sort_index()
-    for year, count in year_counts.items():
-        if count >= 365:  # leap‑year OK (366)
-            detail_rows = f"Using {count} rows for year {year}."
-            break
-    else:  # no break
-        return (
-            "Error - no full year of rows",
-            "The sheet has dates, but none of the years contains ≥365 rows.",
-        )  # type: ignore[return-value]
-
-    # Additional detail about extra numeric columns (totals, etc.)
-    extra_cols = n_numeric - expected_cols
-    extra_note = (
-        " (" + ("+" if extra_cols > 0 else "") + f"{extra_cols} extra column(s) ignored)"
-        if extra_cols != 0
-        else ""
-    )
+    for y in sorted({d.year for d in dt}):
+        rows = int((dt.dt.year == y).sum())
+        if rows >= 365:
+            extra = n_num - expected_cols
+            extra_note = f" (+{extra} extra cols ignored)" if extra else ""
+            return (
+                f"2D {gran}",
+                f"{rows} date‑rows for {y}. Using first {expected_cols} of {n_num} numeric columns{extra_note}.",
+            )
 
     return (
-        f"2D {granularity}",
-        f"{detail_rows} Detected {n_numeric} numeric columns – first {expected_cols} treated as "
-        f"interval data{extra_note}.",
-    )
+        "Error – no full 2‑D year",
+        "Sheet has dates but none of the years contains ≥365 rows.",
+    )  # type: ignore[return-value]
 
 
-# ───────────────────────────── Streamlit UI ───────────────────────────────── #
+# ───────────────────────────── STREAMLIT UI ──────────────────────────────── #
 
 def main() -> None:  # noqa: D401
     st.set_page_config(page_title="Electricity Diagram Format Recognizer", page_icon="⚡")
     st.title("⚡ Electricity Diagram Format Recognizer")
 
-    # Verify openpyxl availability once for friendlier UX
     try:
-        import openpyxl  # noqa: F401 – presence check only
+        import openpyxl  # noqa: F401 – presence check
     except ModuleNotFoundError:
-        st.error(
-            "**openpyxl** is required for .xlsx files. Install with `pip install openpyxl`"
-            " (or add it to *requirements.txt*) and restart."
-        )
+        st.error("Install **openpyxl** with `pip install openpyxl` and restart the app.")
         st.stop()
 
-    uploaded = st.file_uploader("Upload an XLSX workbook", type=["xlsx", "xls"], key="uploader")
-    if uploaded is None:
-        st.info("⬆️ Drag & drop or browse to upload an Excel file.")
+    upl = st.file_uploader("Upload an XLSX workbook", type=["xlsx", "xls"])
+    if upl is None:
+        st.info("⬆️ Drag‑and‑drop or browse to upload an Excel file.")
         st.stop()
 
-    # Attempt to read workbook
     try:
-        xls = pd.ExcelFile(uploaded)
+        xls = pd.ExcelFile(upl)
     except Exception as exc:  # noqa: BLE001
         st.error(f"❌ Could not open file: {exc}")
         st.stop()
 
-    # Sheet picker
     sheet = xls.sheet_names[0]
     if len(xls.sheet_names) > 1:
-        sheet = st.selectbox("Select sheet", xls.sheet_names, key="sheet_select")
+        sheet = st.selectbox("Select sheet", xls.sheet_names)
 
     try:
         df = xls.parse(sheet)
